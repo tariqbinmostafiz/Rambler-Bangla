@@ -124,7 +124,9 @@ def parse_invoke(line):
 
 
 def sha256_text(s):
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    """Hash logical Unicode text, joining UTF-16 surrogate pairs from smali escapes."""
+    normalized = s.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def method_bounds(lines, name, proto):
@@ -257,11 +259,184 @@ def scan_fingerprints(dexes, fingerprints):
     return hits
 
 
-def analyze(apk, profile, workdir, baksmali_jar):
+def _method_header_parts(header):
+    """Return (method_name, proto) from a smali .method header."""
+    if not header.startswith(".method") or "(" not in header:
+        return None
+    tail = header.split(None, 1)[1].strip()
+    left, right = tail.split("(", 1)
+    name = left.split()[-1]
+    return name, "(" + right
+
+
+def _iter_smali_methods(lines):
+    """Yield (start, end, name, proto) for all methods in a smali file."""
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith(".method"):
+            i += 1
+            continue
+        parts = _method_header_parts(lines[i])
+        if parts is None:
+            i += 1
+            continue
+        name, proto = parts
+        end = i + 1
+        while end < len(lines) and lines[end].strip() != ".end method":
+            end += 1
+        if end >= len(lines):
+            raise PatchError("unterminated method %s%s" % (name, proto))
+        yield i, end, name, proto
+        i = end + 1
+
+
+def _write_register(line):
+    """Best-effort destination register for instructions that overwrite one."""
+    m = re.match(
+        r"^\s*(?:const(?:-[\w/-]+)?|move(?:-[\w/-]+)?|move-result(?:-[\w/-]+)?|check-cast|new-instance|new-array|iget(?:-[\w/-]+)?|sget(?:-[\w/-]+)?)\s+([vp]\d+)\b",
+        line)
+    return m.group(1) if m else None
+
+
+def find_hinglish_rule_site(lines, mstart, mend, placeholder, begins):
+    """Find the stock rule by a stable opening fragment and prove it's used
+    as the third argument when replacing {HINGLISH_OVERRIDE_RULE}.
+
+    This is a structural compatibility check, not proof that arbitrary APKs
+    have compatible control flow. It intentionally refuses ambiguous sites.
+    """
+    rules = []
+    placeholders = []
+    for i in range(mstart, mend + 1):
+        parsed = parse_const_string(lines[i])
+        if not parsed:
+            continue
+        reg, value = parsed
+        if value.startswith(begins):
+            rules.append((i, reg, value))
+        if value == placeholder:
+            placeholders.append((i, reg))
+    candidates = []
+    for rule_idx, rule_reg, _value in rules:
+        for ph_idx, ph_reg in placeholders:
+            if ph_reg == rule_reg:
+                continue
+            for invoke_idx in range(max(rule_idx, ph_idx) + 1, mend + 1):
+                inv = parse_invoke(lines[invoke_idx])
+                if not inv:
+                    continue
+                regs, ref = inv
+                if ref != STRING_REPLACE or len(regs) != 3:
+                    continue
+                if regs[1] != ph_reg or regs[2] != rule_reg:
+                    continue
+                # Reject a reused register if another instruction overwrote it
+                # after its matching const-string and before this replace.
+                clobbered = False
+                for j in range(min(rule_idx, ph_idx) + 1, invoke_idx):
+                    dest = _write_register(lines[j])
+                    if dest == rule_reg and j != rule_idx:
+                        clobbered = True
+                    if dest == ph_reg and j != ph_idx:
+                        clobbered = True
+                if not clobbered:
+                    candidates.append((rule_idx, rule_reg))
+                break
+    unique = sorted(set(candidates))
+    if len(unique) != 1:
+        if not unique:
+            raise PatchError("adaptive mode could not identify the Hinglish rule + placeholder replacement structurally")
+        raise PatchError("adaptive mode found multiple plausible Hinglish rule sites; refusing ambiguous patch")
+    return unique[0]
+
+
+def discover_adaptive_builder(dexes, profile):
+    """Discover compatible cleanup-builder methods without class/method hashes.
+
+    Requires the enabled-languages placeholder -> String.replace dataflow and
+    a recognisable Hinglish override string used to replace its placeholder.
+    The exact prompt/rule hashes are advisory in adaptive mode; instruction
+    structure remains a mandatory safety gate.
+    """
+    enabled_placeholder = profile.anchors["enabled_languages_placeholder"]
+    hinglish_placeholder = profile.anchors["hinglish_placeholder"]
+    begins = profile.fingerprints["hinglish_override_rule"].get(
+        "begins", "3. Hinglish Override")
+    found = []
+    for dex_name, ddir in dexes:
+        for root, _dirs, files in os.walk(ddir):
+            for fn in files:
+                if not fn.endswith(".smali"):
+                    continue
+                path = os.path.join(root, fn)
+                with open(path, encoding="utf-8") as fh:
+                    lines = fh.read().splitlines()
+                cls = None
+                for line in lines:
+                    if line.startswith(".class"):
+                        parts = line.split()
+                        if parts:
+                            cls = parts[-1]
+                        break
+                if not cls:
+                    continue
+                for start, end, name, proto in _iter_smali_methods(lines):
+                    method_lines = lines[start:end + 1]
+                    # Already-patched methods aren't candidates.
+                    if any(profile.ext_class in line for line in method_lines):
+                        continue
+                    has_enabled = any(
+                        (p := parse_const_string(line)) is not None and p[1] == enabled_placeholder
+                        for line in method_lines)
+                    if not has_enabled:
+                        continue
+                    try:
+                        _langs_reg, _result_reg, replace_end = find_enabled_languages_site(
+                            lines, start, end, enabled_placeholder)
+                        rule_idx, _rule_reg = find_hinglish_rule_site(
+                            lines, start, end, hinglish_placeholder, begins)
+                    except PatchError:
+                        continue
+                    if rule_idx <= replace_end:
+                        continue
+                    header = lines[start]
+                    is_static = bool(re.search(r"\bstatic\b", header))
+                    found.append({
+                        "dex": dex_name, "file": path, "class": cls,
+                        "name": name, "signature": proto,
+                        "is_static": is_static, "start": start, "end": end,
+                    })
+    if len(found) != 1:
+        if not found:
+            raise PatchError(
+                "adaptive mode found no compatible cleanup builder. This APK may use a different prompt model or placeholder flow; no patch was written.")
+        details = ["%s->%s%s (%s)" % (x["class"], x["name"], x["signature"], x["dex"])
+                   for x in found]
+        raise PatchError("adaptive mode found multiple candidate builders; refusing ambiguous patch: " + "; ".join(details))
+    return found[0]
+
+
+def apply_adaptive_target(profile, target):
+    """Use the discovered builder anchor for downstream existing patch helpers."""
+    profile.methods["cleanup_builder"] = {
+        "class": target["class"], "name": target["name"],
+        "signature": target["signature"], "dex": target["dex"],
+        "evidence": "discovered by structural placeholders and String.replace dataflow",
+    }
+
+
+def analyze(apk, profile, workdir, baksmali_jar, adaptive=False):
     dexes = disassemble_all(apk, workdir, baksmali_jar)
+    adaptive_target = None
+    if adaptive:
+        adaptive_target = discover_adaptive_builder(dexes, profile)
+        apply_adaptive_target(profile, adaptive_target)
     hits = scan_fingerprints(dexes, profile.fingerprints)
     report = {"apk": apk, "dexes": [d for d, _ in dexes],
-              "fingerprint_hits": hits, "methods": {}}
+              "fingerprint_hits": hits, "methods": {},
+              "mode": "adaptive" if adaptive else "profiled"}
+    if adaptive_target:
+        report["adaptive_target"] = adaptive_target
     for key in profile.methods:
         cls, name, proto = profile.method(key)
         found = None
@@ -330,7 +505,7 @@ def hook_snippet(temp0, src_reg, langs_reg, ext, hook):
     ]
 
 
-def patch_method(lines, profile, fingerprints_ok):
+def patch_method(lines, profile, fingerprints_ok, adaptive=False):
     cls, name, proto = profile.method("cleanup_builder")
     is_static = " static " in (" " + lines[0])  # caller passes method lines only
     mstart, mend = method_bounds(lines, name, proto)
@@ -346,17 +521,23 @@ def patch_method(lines, profile, fingerprints_ok):
     langs_reg, result_reg, replace_end = find_enabled_languages_site(
         lines, mstart, mend, placeholder)
 
-    rule_fp = profile.fingerprints["hinglish_override_rule"]["sha256"]
-    rule_idx = None
-    rule_reg = None
-    for i in range(mstart, mend + 1):
-        p = parse_const_string(lines[i])
-        if p and sha256_text(p[1]) == rule_fp:
-            rule_idx, rule_reg = i, p[0]
-            break
-    if rule_idx is None:
-        raise PatchError("stock Hinglish override const-string not found in "
-                         "kfd.d (fingerprint %s)" % rule_fp)
+    if adaptive:
+        rule_idx, rule_reg = find_hinglish_rule_site(
+            lines, mstart, mend, profile.anchors["hinglish_placeholder"],
+            profile.fingerprints["hinglish_override_rule"].get(
+                "begins", "3. Hinglish Override"))
+    else:
+        rule_fp = profile.fingerprints["hinglish_override_rule"]["sha256"]
+        rule_idx = None
+        rule_reg = None
+        for i in range(mstart, mend + 1):
+            p = parse_const_string(lines[i])
+            if p and sha256_text(p[1]) == rule_fp:
+                rule_idx, rule_reg = i, p[0]
+                break
+        if rule_idx is None:
+            raise PatchError("stock Hinglish override const-string not found in "
+                             "cleanup-builder method (fingerprint %s)" % rule_fp)
     if rule_idx < replace_end:
         raise PatchError("stock override rule loads BEFORE the "
                          "{ENABLED_LANGUAGES} substitution; this build's "
@@ -400,16 +581,21 @@ def verify_prompt_owner(lines_by_class, profile):
 
 
 def patch(apk, out_apk, profile, workdir, baksmali_jar, smali_jar,
-          extension_dex=None):
+          extension_dex=None, adaptive=False):
     dexes = disassemble_all(apk, workdir, baksmali_jar)
 
-    # 1. Fail-closed fingerprint sweep across the whole APK.
+    # Exact hashes are mandatory in the stable profile mode. Adaptive mode
+    # treats them as diagnostics and requires unambiguous structural anchors.
     hits = scan_fingerprints(dexes, profile.fingerprints)
-    for key, fp in profile.fingerprints.items():
-        if not hits[key]:
-            raise PatchError("fingerprint %s (%s) not found anywhere in the "
-                             "APK; refusing to patch an unrecognized build"
-                             % (fp["sha256"], key))
+    if adaptive:
+        discovered = discover_adaptive_builder(dexes, profile)
+        apply_adaptive_target(profile, discovered)
+    else:
+        for key, fp in profile.fingerprints.items():
+            if not hits[key]:
+                raise PatchError("fingerprint %s (%s) not found anywhere in the "
+                                 "APK; refusing to patch an unrecognized build"
+                                 % (fp["sha256"], key))
 
     # 2. Locate the cleanup-builder method's dex.
     cls, name, proto = profile.method("cleanup_builder")
@@ -430,23 +616,26 @@ def patch(apk, out_apk, profile, workdir, baksmali_jar, smali_jar,
 
     dex_name, ddir, path, lines = target
 
-    # 3. Verify the prompt-owner fingerprint before touching anything.
-    pcls, pname, pproto = profile.method("prompt_owner")
-    plines = None
-    for dn2, dd2 in dexes:
-        ppath = os.path.join(dd2, smali_class_path(pcls))
-        if os.path.exists(ppath):
-            with open(ppath, encoding="utf-8") as fh:
-                cand = fh.read().splitlines()
-            try:
-                method_bounds(cand, pname, pproto)
-                plines = cand
-            except PatchError:
-                continue
-    verify_prompt_owner({pcls: plines} if plines else {}, profile)
+    # 3. In profile mode, require the exact prompt owner. Adaptive mode
+    # deliberately does not require the whole prompt hash; it instead requires
+    # the builder's placeholder/replacement structure and unique target.
+    if not adaptive:
+        pcls, pname, pproto = profile.method("prompt_owner")
+        plines = None
+        for _dn2, dd2 in dexes:
+            ppath = os.path.join(dd2, smali_class_path(pcls))
+            if os.path.exists(ppath):
+                with open(ppath, encoding="utf-8") as fh:
+                    cand = fh.read().splitlines()
+                try:
+                    method_bounds(cand, pname, pproto)
+                    plines = cand
+                except PatchError:
+                    continue
+        verify_prompt_owner({pcls: plines} if plines else {}, profile)
 
     # 4. Rewrite the cleanup builder.
-    new_lines = patch_method(lines, profile, hits)
+    new_lines = patch_method(lines, profile, hits, adaptive=adaptive)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(new_lines) + "\n")
 
@@ -486,6 +675,8 @@ def main(argv=None):
     ap.add_argument("--smali-jar", default=os.environ.get(
         "SMALI_JAR", "tools/smali-2.5.2.jar"))
     ap.add_argument("--extension-dex")
+    ap.add_argument("--adaptive", action="store_true",
+                    help="discover a uniquely matching cleanup builder by placeholders/dataflow; hashes are advisory")
     args = ap.parse_args(argv)
 
     profile = Profile(args.profile)
@@ -496,14 +687,14 @@ def main(argv=None):
     try:
         if args.command == "analyze":
             report = analyze(args.apk, profile, args.workdir,
-                             args.baksmali_jar)
+                             args.baksmali_jar, adaptive=args.adaptive)
             print(json.dumps(report, indent=2, ensure_ascii=False))
             return 0
         if not args.out:
             ap.error("patch requires --out")
         result = patch(args.apk, args.out, profile, args.workdir,
                        args.baksmali_jar, args.smali_jar,
-                       args.extension_dex)
+                       args.extension_dex, adaptive=args.adaptive)
         print(json.dumps(result, indent=2))
         return 0
     except PatchError as exc:

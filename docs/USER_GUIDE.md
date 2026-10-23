@@ -126,6 +126,38 @@ The patcher:
 On success it prints a short JSON summary naming the patched DEX and the output
 path. The output is **unsigned** and will not install until you sign it.
 
+### Experimental adaptive mode (compatible revisions only)
+
+If a newer Gboard/PixelBoard build has changed class names, method names, and
+prompt/rule hashes but kept the same placeholder/dataflow structure, try
+`--adaptive`. This mode locates one unambiguous cleanup builder by requiring
+both placeholders, a `String.replace` flow for `{ENABLED_LANGUAGES}`, and a
+recognizable `3. Hinglish Override` rule used for the second replacement.
+It treats exact SHA-256 fingerprints as diagnostics rather than hard gates and
+does not require the old prompt-owner method/hash. It still aborts if no unique
+structural candidate can be proved. The runtime's prompt rewrite also requires
+its known SCRIPT GATE text, so a successful build does not prove that every
+new prompt model will be rewritten at runtime.
+
+```bash
+python3 standalone-patcher/dex_patch.py analyze \
+  --apk /path/to/base.apk \
+  --profile fingerprints/gboard-18.3.1.json \
+  --adaptive
+
+python3 standalone-patcher/dex_patch.py patch \
+  --apk /path/to/base.apk \
+  --out /path/to/rambler-unsigned.apk \
+  --profile fingerprints/gboard-18.3.1.json \
+  --extension-dex build/ext-dex/classes.dex \
+  --adaptive
+```
+
+This mode is intended for Gboard/PixelBoard-compatible builds that preserve the
+same runtime contract. It cannot safely patch arbitrary keyboard apps or a
+model with a different request structure. Always run analyzer first and test
+the signed output on a spare install before replacing your working keyboard.
+
 Options:
 
 | Option | Purpose |

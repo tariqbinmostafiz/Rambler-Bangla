@@ -2,8 +2,9 @@
 
 Rambler Bangla has three parts that meet at one method inside Gboard 18.3.1:
 
-1. a **fail-closed smali patcher** (`standalone-patcher/dex_patch.py`) driven by
-   a hash-only profile (`fingerprints/gboard-18.3.1.json`),
+1. a **smali patcher** (`standalone-patcher/dex_patch.py`) with a stable
+   fingerprint-locked profile (`fingerprints/gboard-18.3.1.json`) and an
+   explicitly experimental structural-adaptive mode,
 2. a **policy runtime** in pure Java (`extension-src/`) that the patched
    keyboard calls,
 3. a **device-free CI suite** that builds a synthetic APK, patches it and
@@ -114,9 +115,16 @@ single description of the target build:
 | `known_limits` | Documented limits of the profile |
 
 The profile stores hashes, not the strings, so no Google prompt text is
-reproduced in the repository. Supporting a new Gboard build means capturing new
-anchors and fingerprints with `analyze` and adding a new profile; see
-[`RELEASING.md`](RELEASING.md#fingerprint-updates).
+reproduced in the repository. The default mode stays fingerprint-locked.
+`--adaptive` is a separate experimental route that finds a unique cleanup
+builder by `{ENABLED_LANGUAGES}` replacement flow and the recognizable
+`3. Hinglish Override` rule used for `{HINGLISH_OVERRIDE_RULE}`; exact hashes
+and the old prompt-owner method are diagnostics rather than hard gates in that
+mode. It does not claim compatibility with arbitrary keyboards or model
+implementations: structural ambiguity aborts, and runtime prompt rewriting can
+still no-op when the new model's prompt no longer contains the known SCRIPT
+GATE block. For unsupported builds, capturing a new profile and validating the
+new behavior remains necessary.
 
 ## Policy runtime
 

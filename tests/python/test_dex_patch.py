@@ -140,6 +140,66 @@ class FixtureSmaliTests(unittest.TestCase):
         self.assertEqual(snip[-1].split(), ["move-object/from16", "v0,", "v3"])
 
 
+class AdaptiveDiscoveryTests(unittest.TestCase):
+    """Adaptive mode tolerates hash/name changes only when dataflow is clear."""
+
+    def test_adaptive_finds_renamed_builder_and_changed_rule_hash(self):
+        import tempfile
+        from pathlib import Path
+
+        profile = dp.Profile(os.path.join(ROOT, "fixtures", "fixture-profile.json"))
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "classes"
+            d.mkdir()
+            kfd = read_lines(os.path.join(ROOT, "fixtures", "src", "kfd.smali"))
+            # Emulate an app revision: obfuscated class/method/proto changes and
+            # the policy string changes while retaining its recognizable heading.
+            kfd = [line.replace("Lkfd;", "Lrevision/Builder;")
+                       .replace(".method public static d(Lhrl;Ljava/lang/String;ILqqi;Laebb;Ljava/lang/String;Laugd;Ljava/util/concurrent/atomic/AtomicBoolean;)V",
+                                ".method public static buildRevision()V")
+                       .replace("3. Hinglish Override:", "3. Hinglish Override revision:")
+                   for line in kfd]
+            (d / "Builder.smali").write_text("\n".join(kfd) + "\n", encoding="utf-8")
+            kew = read_lines(os.path.join(ROOT, "fixtures", "src", "kew.smali"))
+            kew = [line.replace("Lkew;", "Lrevision/Prompt;")
+                       .replace("<fixture_system_role>", "<different_prompt_model>")
+                   for line in kew]
+            (d / "Prompt.smali").write_text("\n".join(kew) + "\n", encoding="utf-8")
+            target = dp.discover_adaptive_builder([("classes3.dex", td)], profile)
+            self.assertEqual(target["class"], "Lrevision/Builder;")
+            self.assertEqual(target["name"], "buildRevision")
+            self.assertEqual(target["signature"], "()V")
+            dp.apply_adaptive_target(profile, target)
+            lines = read_lines(str(d / "Builder.smali"))
+            patched = dp.patch_method(lines, profile, {}, adaptive=True)
+            joined = "\n".join(patched)
+            self.assertIn("selectHinglishOverrideRule", joined)
+            self.assertIn("rewriteCleanupPromptScriptGate", joined)
+
+    def test_adaptive_refuses_ambiguous_builders(self):
+        import tempfile
+        from pathlib import Path
+
+        profile = dp.Profile(os.path.join(ROOT, "fixtures", "fixture-profile.json"))
+        with tempfile.TemporaryDirectory() as td:
+            for folder, class_name in (("one", "Lrevision/BuilderOne;"),
+                                       ("two", "Lrevision/BuilderTwo;")):
+                d = Path(td) / folder
+                d.mkdir()
+                kfd = read_lines(os.path.join(ROOT, "fixtures", "src", "kfd.smali"))
+                kfd = [line.replace("Lkfd;", class_name) for line in kfd]
+                (d / "Builder.smali").write_text("\n".join(kfd) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(dp.PatchError, "multiple candidate builders"):
+                dp.discover_adaptive_builder([("classes3.dex", td)], profile)
+
+    def test_sha256_handles_smali_utf16_surrogate_pair(self):
+        # The same glyph as a literal Unicode character and a UTF-16 surrogate
+        # pair should hash to the same logical UTF-8 text.
+        literal = "A😀B"
+        escaped_pair = "A\ud83d\ude00B"
+        self.assertEqual(dp.sha256_text(literal), dp.sha256_text(escaped_pair))
+
+
 class ProfileTests(unittest.TestCase):
     PROFILES = [os.path.join(ROOT, "fingerprints", "gboard-18.3.1.json"),
                 os.path.join(ROOT, "fixtures", "fixture-profile.json")]
